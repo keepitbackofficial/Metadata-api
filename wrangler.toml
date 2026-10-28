@@ -1,3 +1,5 @@
-name = "keepitback-metadata-api"
+name = 'metadata-api'
 main = "./api.js"
 compatibility_date = "2026-10-28"
+# wrangler.toml
+name = 'metadata-api'
