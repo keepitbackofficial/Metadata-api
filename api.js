@@ -1,25 +1,8 @@
 const PLATFORM_DOMAINS = {
-  yt: [
-    "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
-    "youtu.be"
-  ],
-  ig: [
-    "instagram.com",
-    "www.instagram.com"
-  ],
-  tt: [
-    "tiktok.com",
-    "www.tiktok.com",
-    "m.tiktok.com"
-  ],
-  fb: [
-    "facebook.com",
-    "www.facebook.com",
-    "m.facebook.com",
-    "fb.watch"
-  ]
+  yt: ["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"],
+  ig: ["instagram.com", "www.instagram.com"],
+  tt: ["tiktok.com", "www.tiktok.com", "m.tiktok.com"],
+  fb: ["facebook.com", "www.facebook.com", "m.facebook.com", "fb.watch"]
 };
 
 const PLATFORM_NAMES = {
@@ -49,10 +32,7 @@ function json(data, status = 200) {
 function errorResponse(code, message, status = 400) {
   return json({
     success: false,
-    error: {
-      code,
-      message
-    }
+    error: { code, message }
   }, status);
 }
 
@@ -67,24 +47,16 @@ function decodeEntities(value) {
     .replace(/&#39;|&apos;/gi, "'")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
-    .replace(/&#(\d+);/g, (_, n) => {
-      const code = Number(n);
-      return code <= 0x10ffff
-        ? String.fromCodePoint(code)
-        : _;
+    .replace(/&#(\d+);/g, (match, digits) => {
+      const code = Number(digits);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : match;
     })
-    .replace(/&#x([0-9a-f]+);/gi, (_, n) => {
-      const code = parseInt(n, 16);
-      return code <= 0x10ffff
-        ? String.fromCodePoint(code)
-        : _;
+    .replace(/&#x([0-9a-f]+);/gi, (match, digits) => {
+      const code = parseInt(digits, 16);
+      return code <= 0x10ffff ? String.fromCodePoint(code) : match;
     });
 }
 
-/*
- * Extract metadata from HTML.
- * Supports different attribute orders and quote styles.
- */
 function getMeta(html, property) {
   const key = escapeRegex(property);
 
@@ -113,10 +85,7 @@ function getMeta(html, property) {
 
   for (const pattern of patterns) {
     const match = html.match(pattern);
-
-    if (match && match[1]) {
-      return decodeEntities(match[1].trim());
-    }
+    if (match?.[1]) return decodeEntities(match[1].trim());
   }
 
   return null;
@@ -156,8 +125,8 @@ function getThumbnail(html) {
 function getAuthor(html) {
   return (
     getMeta(html, "author") ||
-    getMeta(html, "og:video:release_date") ||
     getMeta(html, "twitter:creator") ||
+    getMeta(html, "og:video:release_date") ||
     null
   );
 }
@@ -166,9 +135,6 @@ function getContentType(html) {
   return getMeta(html, "og:type") || null;
 }
 
-/*
- * Extract useful fields from JSON-LD when a page provides it.
- */
 function getJsonLd(html) {
   const scripts = html.matchAll(
     /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
@@ -176,53 +142,56 @@ function getJsonLd(html) {
 
   for (const match of scripts) {
     try {
-      const data = JSON.parse(
-        decodeEntities(match[1].trim())
-      );
-
+      const data = JSON.parse(match[1].trim());
       const objects = Array.isArray(data) ? data : [data];
 
       for (const item of objects) {
-        if (!item || typeof item !== "object") {
-          continue;
-        }
+        if (!item || typeof item !== "object") continue;
 
-        const image = Array.isArray(item.image)
-          ? item.image[0]
-          : item.image;
+        // Handle JSON-LD graphs.
+        const candidates = Array.isArray(item["@graph"])
+          ? item["@graph"]
+          : [item];
 
-        const author = Array.isArray(item.author)
-          ? item.author[0]
-          : item.author;
+        for (const candidate of candidates) {
+          if (!candidate || typeof candidate !== "object") continue;
 
-        return {
-          title:
-            item.headline ||
-            item.name ||
-            null,
+          const image = Array.isArray(candidate.image)
+            ? candidate.image[0]
+            : candidate.image;
 
-          description:
-            item.description ||
-            null,
+          const author = Array.isArray(candidate.author)
+            ? candidate.author[0]
+            : candidate.author;
 
-          thumbnail:
-            typeof image === "string"
+          const name = author && typeof author === "object"
+            ? author.name
+            : author;
+
+          const result = {
+            title: candidate.headline || candidate.name || null,
+            description: candidate.description || null,
+            thumbnail: typeof image === "string"
               ? image
               : image?.url || image?.contentUrl || null,
+            author: typeof name === "string" ? name : null,
+            type: Array.isArray(candidate["@type"])
+              ? candidate["@type"][0]
+              : candidate["@type"] || null
+          };
 
-          author:
-            typeof author === "string"
-              ? author
-              : author?.name || null,
-
-          type:
-            Array.isArray(item["@type"])
-              ? item["@type"][0]
-              : item["@type"] || null
-        };
+          if (
+            result.title ||
+            result.description ||
+            result.thumbnail ||
+            result.author
+          ) {
+            return result;
+          }
+        }
       }
     } catch {
-      // Ignore invalid JSON-LD and continue.
+      // Continue when the page contains invalid JSON-LD.
     }
   }
 
@@ -230,27 +199,16 @@ function getJsonLd(html) {
 }
 
 function normalizeImage(image, pageUrl) {
-  if (!image) {
-    return null;
-  }
+  if (!image) return null;
 
   try {
     const parsed = new URL(image, pageUrl);
-
-    if (parsed.protocol !== "https:") {
-      return null;
-    }
-
-    return parsed.href;
+    return parsed.protocol === "https:" ? parsed.href : null;
   } catch {
     return null;
   }
 }
 
-/*
- * Remove common tracking parameters from the returned URL.
- * This does not change the source metadata request.
- */
 function cleanUrl(url) {
   const cleaned = new URL(url.href);
 
@@ -273,7 +231,6 @@ function cleanUrl(url) {
   }
 
   cleaned.hash = "";
-
   return cleaned.href;
 }
 
@@ -283,9 +240,6 @@ function isAllowedHost(platform, hostname) {
   ) ?? false;
 }
 
-/*
- * Validate the URL before making an external request.
- */
 function validateTarget(platform, rawUrl) {
   if (
     typeof rawUrl !== "string" ||
@@ -319,10 +273,6 @@ function validateTarget(platform, rawUrl) {
   return target;
 }
 
-/*
- * Fetch HTML while checking each redirect destination.
- * This prevents redirects to arbitrary external hosts.
- */
 async function fetchHtml(platform, initialUrl) {
   let currentUrl = new URL(initialUrl.href);
 
@@ -342,18 +292,14 @@ async function fetchHtml(platform, initialUrl) {
           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
           "AppleWebKit/537.36 (KHTML, like Gecko) " +
           "Chrome/131.0.0.0 Safari/537.36",
-
         "Accept":
           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-
         "Accept-Language": "en-US,en;q=0.9"
       },
       signal: AbortSignal.timeout(FETCH_TIMEOUT)
     });
 
-    if (
-      [301, 302, 303, 307, 308].includes(response.status)
-    ) {
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get("location");
 
       if (!location || attempt === MAX_REDIRECTS) {
@@ -377,8 +323,7 @@ async function fetchHtml(platform, initialUrl) {
       throw new Error(`UPSTREAM_HTTP_${response.status}`);
     }
 
-    const contentType =
-      response.headers.get("content-type") || "";
+    const contentType = response.headers.get("content-type") || "";
 
     if (
       !contentType.includes("text/html") &&
@@ -401,30 +346,36 @@ async function fetchHtml(platform, initialUrl) {
       throw new Error("UPSTREAM_RESPONSE_TOO_LARGE");
     }
 
-    return {
-      html,
-      finalUrl: currentUrl
-    };
+    return { html, finalUrl: currentUrl };
   }
 
   throw new Error("UPSTREAM_REDIRECT_LIMIT");
 }
 
-/*
- * HTML-based metadata extraction.
- *
- * Instagram may return limited metadata or a login page.
- * In that case, the result may still be incomplete.
- */
+const GENERIC_TITLES = new Set([
+  "instagram",
+  "facebook",
+  "log in • instagram",
+  "log in • instagram",
+  "facebook - log in or sign up",
+  "log in or sign up to view"
+]);
+
+function isGenericTitle(value) {
+  return typeof value === "string" &&
+    GENERIC_TITLES.has(value.trim().toLowerCase());
+}
+
 async function fetchOpenGraph(platform, url) {
   const { html, finalUrl } = await fetchHtml(platform, url);
-
   const jsonLd = getJsonLd(html);
 
-  const title =
-    getTitle(html) ||
-    jsonLd.title ||
-    null;
+  const htmlTitle = getTitle(html);
+
+  // Do not mistake a generic login page title for the post title.
+  const title = isGenericTitle(htmlTitle)
+    ? (!isGenericTitle(jsonLd.title) ? jsonLd.title || null : null)
+    : (htmlTitle || jsonLd.title || null);
 
   const description =
     getDescription(html) ||
@@ -432,9 +383,7 @@ async function fetchOpenGraph(platform, url) {
     null;
 
   const thumbnail = normalizeImage(
-    getThumbnail(html) ||
-      jsonLd.thumbnail ||
-      null,
+    getThumbnail(html) || jsonLd.thumbnail || null,
     finalUrl.href
   );
 
@@ -448,11 +397,11 @@ async function fetchOpenGraph(platform, url) {
     jsonLd.type ||
     null;
 
-  if (platform === "ig" && url.pathname.includes("/reel/")) {
-    type = "video";
-  } else if (platform === "yt" && url.pathname.includes("/shorts/")) {
-    type = "video";
-  } else if (platform === "tt") {
+  if (
+    (platform === "ig" && /\/(reel|reels|p)\//i.test(url.pathname)) ||
+    (platform === "yt" && url.pathname.includes("/shorts/")) ||
+    platform === "tt"
+  ) {
     type = "video";
   }
 
@@ -461,20 +410,210 @@ async function fetchOpenGraph(platform, url) {
     description,
     thumbnail,
     author,
-    type: type || "website"
+    type: type || "video"
   };
 }
 
-/*
- * YouTube oEmbed.
- * Keeps the existing YouTube approach.
- */
 async function fetchYouTube(url) {
-  const endpoint = new URL(
-    "https://www.youtube.com/oembed"
-  );
-
+  const endpoint = new URL("https://www.youtube.com/oembed");
   endpoint.searchParams.set("url", url.href);
+  endpoint.searchParams.set("format", "json");
+
+  const response = await fetch(endpoint.href, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT)
+  });
+
+  if (!response.ok) {
+    throw new Error(`YOUTUBE_OEMBED_HTTP_${response.status}`);
+  }
+
+  const data = await response.json();
+
+  return {
+    title: data.title || null,
+    description: null,
+    thumbnail: normalizeImage(data.thumbnail_url, url.href),
+    author: data.author_name || null,
+    type: "video"
+  };
+}
+
+async function fetchTikTok(url) {
+  const endpoint = new URL("https://www.tiktok.com/oembed");
+  endpoint.searchParams.set("url", url.href);
+
+  const response = await fetch(endpoint.href, {
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT)
+  });
+
+  if (!response.ok) {
+    throw new Error(`TIKTOK_OEMBED_HTTP_${response.status}`);
+  }
+
+  const data = await response.json();
+
+  return {
+    title: data.title || null,
+    description: data.title || null,
+    thumbnail: normalizeImage(data.thumbnail_url, url.href),
+    author: data.author_name || null,
+    type: data.type || "video"
+  };
+}
+
+async function getMetadata(platform, url) {
+  if (platform === "yt") return fetchYouTube(url);
+  if (platform === "tt") return fetchTikTok(url);
+  if (platform === "ig" || platform === "fb") {
+    return fetchOpenGraph(platform, url);
+  }
+
+  throw new Error("UNSUPPORTED_PLATFORM");
+}
+
+export default {
+  async fetch(request) {
+    const requestUrl = new URL(request.url);
+
+    if (request.method !== "GET") {
+      return errorResponse(
+        "METHOD_NOT_ALLOWED",
+        "Only GET requests are supported.",
+        405
+      );
+    }
+
+    if (requestUrl.pathname === "/") {
+      return json({
+        success: true,
+        name: "KeepItBack Metadata API",
+        version: "1.2.0",
+        platforms: Object.keys(PLATFORM_NAMES),
+        usage: {
+          query: "/yt?url=<encoded-url>",
+          path: "/yt/<url>"
+        }
+      });
+    }
+
+    const parts = requestUrl.pathname.split("/").filter(Boolean);
+    const platform = parts[0];
+
+    if (!PLATFORM_NAMES[platform]) {
+      return errorResponse(
+        "UNSUPPORTED_PLATFORM",
+        "Supported platform codes: yt, ig, tt, fb.",
+        404
+      );
+    }
+
+    let rawUrl = requestUrl.searchParams.get("url");
+
+    if (!rawUrl && parts.length > 1) {
+      rawUrl = parts.slice(1).join("/");
+
+      try {
+        rawUrl = decodeURIComponent(rawUrl);
+      } catch {
+        return errorResponse(
+          "INVALID_URL",
+          "The supplied URL is incorrectly encoded."
+        );
+      }
+    }
+
+    if (!rawUrl) {
+      return errorResponse(
+        "MISSING_URL",
+        "Provide a URL using ?url=<encoded-url>."
+      );
+    }
+
+    let target;
+
+    try {
+      target = validateTarget(platform, rawUrl);
+    } catch (error) {
+      if (error.message === "PLATFORM_MISMATCH") {
+        return errorResponse(
+          "PLATFORM_MISMATCH",
+          "The URL does not belong to the selected platform."
+        );
+      }
+
+      return errorResponse(
+        "INVALID_URL",
+        "Provide a valid HTTPS URL from a supported domain."
+      );
+    }
+
+    try {
+      const metadata = await getMetadata(platform, target);
+
+      const hasUsefulTitle =
+        metadata.title && !isGenericTitle(metadata.title);
+
+      if (
+        !hasUsefulTitle &&
+        !metadata.thumbnail &&
+        !metadata.description
+      ) {
+        return errorResponse(
+          "METADATA_UNAVAILABLE",
+          "No usable metadata was found. The platform may have returned a login page, restricted the request, or omitted metadata.",
+          502
+        );
+      }
+
+      return json({
+        success: true,
+        platform: PLATFORM_NAMES[platform],
+        url: cleanUrl(target),
+        title: hasUsefulTitle ? metadata.title : null,
+        description: metadata.description || null,
+        thumbnail: metadata.thumbnail || null,
+        author: metadata.author || null,
+        type: metadata.type || "video"
+      });
+    } catch (error) {
+      console.error("Metadata extraction failed", {
+        platform,
+        error: error instanceof Error ? error.message : String(error)
+      });
+
+      let message =
+        "The platform did not provide usable metadata. The content may be private, unavailable, or restricted.";
+
+      if (
+        error instanceof Error &&
+        error.message.startsWith("UPSTREAM_HTTP_")
+      ) {
+        message =
+          "The upstream platform returned an HTTP error. Check Cloudflare Worker logs for details.";
+      } else if (
+        error instanceof Error &&
+        error.message.startsWith("UPSTREAM_REDIRECT")
+      ) {
+        message =
+          "The upstream platform redirected the request somewhere that could not be followed safely.";
+      } else if (
+        error instanceof Error &&
+        error.message === "UPSTREAM_NOT_HTML"
+      ) {
+        message = "The upstream platform did not return an HTML page.";
+      } else if (
+        error instanceof Error &&
+        error.name === "TimeoutError"
+      ) {
+        message = "The upstream platform took too long to respond.";
+      }
+
+      return errorResponse("METADATA_UNAVAILABLE", message, 502);
+    }
+  }
+};
   endpoint.searchParams.set("format", "json");
 
   const response = await fetch(endpoint.href, {
