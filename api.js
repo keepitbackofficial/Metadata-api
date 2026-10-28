@@ -1,105 +1,246 @@
+/**
+ * KeepItBack Metadata API
+ * Cloudflare Workers
+ *
+ * Supported platforms:
+ *   YouTube    /yt?url=<encoded-url>
+ *   Instagram  /ig?url=<encoded-url>
+ *   TikTok     /tt?url=<encoded-url>
+ *   Facebook   /fb?url=<encoded-url>
+ *
+ * Instagram/Facebook metadata is extracted from public HTML.
+ * YouTube/TikTok use their oEmbed endpoints.
+ */
+
+const VERSION = "1.3.0";
+
 const PLATFORM_DOMAINS = {
-  yt: ["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"],
-  ig: ["instagram.com", "www.instagram.com"],
-  tt: ["tiktok.com", "www.tiktok.com", "m.tiktok.com"],
-  fb: ["facebook.com", "www.facebook.com", "m.facebook.com", "fb.watch"]
+  yt: [
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+  ],
+  ig: [
+    "instagram.com",
+    "www.instagram.com",
+  ],
+  tt: [
+    "tiktok.com",
+    "www.tiktok.com",
+    "m.tiktok.com",
+  ],
+  fb: [
+    "facebook.com",
+    "www.facebook.com",
+    "m.facebook.com",
+    "fb.watch",
+  ],
 };
 
 const PLATFORM_NAMES = {
   yt: "youtube",
   ig: "instagram",
   tt: "tiktok",
-  fb: "facebook"
+  fb: "facebook",
 };
+
+const GENERIC_TITLES = new Set([
+  "instagram",
+  "facebook",
+  "tiktok",
+  "youtube",
+  "log in • instagram",
+  "log in to instagram",
+  "instagram login",
+  "facebook - log in or sign up",
+  "log in or sign up to view",
+  "log in to facebook",
+  "tiktok - make your day",
+  "youtube",
+]);
+
+const GENERIC_DESCRIPTIONS = new Set([
+  "instagram",
+  "facebook",
+  "tiktok",
+  "youtube",
+  "log in to instagram",
+  "log in to view this content",
+]);
 
 const JSON_HEADERS = {
   "Content-Type": "application/json; charset=utf-8",
-  "Cache-Control": "public, max-age=60",
-  "X-Content-Type-Options": "nosniff"
+  "Cache-Control": "no-store",
+  "X-Content-Type-Options": "nosniff",
 };
 
-const MAX_HTML_SIZE = 1_000_000;
 const FETCH_TIMEOUT = 10000;
+const MAX_HTML_SIZE = 1_000_000;
 const MAX_REDIRECTS = 3;
+const MAX_URL_LENGTH = 4096;
+
+/* -------------------------------------------------------
+   RESPONSE HELPERS
+------------------------------------------------------- */
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
-    headers: JSON_HEADERS
+    headers: JSON_HEADERS,
   });
 }
 
 function errorResponse(code, message, status = 400) {
-  return json({
-    success: false,
-    error: { code, message }
-  }, status);
+  return json(
+    {
+      success: false,
+      error: {
+        code,
+        message,
+      },
+    },
+    status
+  );
 }
 
-function escapeRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function isGenericTitle(value) {
+  if (typeof value !== "string") {
+    return true;
+  }
+
+  return GENERIC_TITLES.has(
+    value.trim().toLowerCase()
+  );
 }
+
+function cleanGenericDescription(value) {
+  if (!value || typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+
+  if (GENERIC_DESCRIPTIONS.has(normalized)) {
+    return null;
+  }
+
+  return value.trim() || null;
+}
+
+/* -------------------------------------------------------
+   HTML METADATA EXTRACTION
+------------------------------------------------------- */
 
 function decodeEntities(value) {
+  if (!value) return null;
+
   return value
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
+    .replace(/&#34;/gi, '"')
     .replace(/&#39;|&apos;/gi, "'")
     .replace(/&lt;/gi, "<")
     .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;/gi, " ")
     .replace(/&#(\d+);/g, (match, digits) => {
       const code = Number(digits);
-      return code <= 0x10ffff ? String.fromCodePoint(code) : match;
+
+      try {
+        return String.fromCodePoint(code);
+      } catch {
+        return match;
+      }
     })
     .replace(/&#x([0-9a-f]+);/gi, (match, digits) => {
       const code = parseInt(digits, 16);
-      return code <= 0x10ffff ? String.fromCodePoint(code) : match;
+
+      try {
+        return String.fromCodePoint(code);
+      } catch {
+        return match;
+      }
     });
 }
 
-function getMeta(html, property) {
-  const key = escapeRegex(property);
+/**
+ * Extracts a tag attribute regardless of attribute order.
+ */
+function getAttribute(tag, attributeName) {
+  const escaped = attributeName.replace(
+    /[.*+?^${}()|[\]\\]/g,
+    "\\$&"
+  );
 
-  const patterns = [
-    new RegExp(
-      `<meta\\b(?=[^>]*\\bproperty\\s*=\\s*["']${key}["'])` +
-      `(?=[^>]*\\bcontent\\s*=\\s*["']([^"']*)["'])[^>]*>`,
-      "i"
-    ),
-    new RegExp(
-      `<meta\\b(?=[^>]*\\bname\\s*=\\s*["']${key}["'])` +
-      `(?=[^>]*\\bcontent\\s*=\\s*["']([^"']*)["'])[^>]*>`,
-      "i"
-    ),
-    new RegExp(
-      `<meta\\b(?=[^>]*\\bcontent\\s*=\\s*["']([^"']*)["'])` +
-      `(?=[^>]*\\bproperty\\s*=\\s*["']${key}["'])[^>]*>`,
-      "i"
-    ),
-    new RegExp(
-      `<meta\\b(?=[^>]*\\bcontent\\s*=\\s*["']([^"']*)["'])` +
-      `(?=[^>]*\\bname\\s*=\\s*["']${key}["'])[^>]*>`,
-      "i"
-    )
-  ];
+  const pattern = new RegExp(
+    "\\b" +
+      escaped +
+      "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))",
+    "i"
+  );
 
-  for (const pattern of patterns) {
-    const match = html.match(pattern);
-    if (match?.[1]) return decodeEntities(match[1].trim());
+  const match = tag.match(pattern);
+
+  if (!match) return null;
+
+  return decodeEntities(
+    match[1] ?? match[2] ?? match[3] ?? ""
+  );
+}
+
+/**
+ * Finds a meta tag by its property or name attribute.
+ */
+function getMeta(html, key) {
+  const tags =
+    html.match(/<meta\b[^>]*>/gi) || [];
+
+  for (const tag of tags) {
+    const property =
+      getAttribute(tag, "property");
+
+    const name =
+      getAttribute(tag, "name");
+
+    const itemKey = (
+      property || name || ""
+    ).trim().toLowerCase();
+
+    if (itemKey !== key.toLowerCase()) {
+      continue;
+    }
+
+    const content =
+      getAttribute(tag, "content");
+
+    if (content) {
+      return content.trim();
+    }
   }
 
   return null;
 }
 
 function getTitle(html) {
-  const title =
+  const metaTitle =
     getMeta(html, "og:title") ||
-    getMeta(html, "twitter:title") ||
-    html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1];
+    getMeta(html, "twitter:title");
 
-  return title
-    ? decodeEntities(title.replace(/<[^>]*>/g, "").trim())
-    : null;
+  if (metaTitle) {
+    return metaTitle.trim();
+  }
+
+  const titleMatch = html.match(
+    /<title\b[^>]*>([\s\S]*?)<\/title>/i
+  );
+
+  if (!titleMatch) return null;
+
+  return decodeEntities(
+    titleMatch[1]
+      .replace(/<[^>]*>/g, "")
+      .trim()
+  );
 }
 
 function getDescription(html) {
@@ -126,58 +267,91 @@ function getAuthor(html) {
   return (
     getMeta(html, "author") ||
     getMeta(html, "twitter:creator") ||
-    getMeta(html, "og:video:release_date") ||
+    getMeta(html, "article:author") ||
+    getMeta(html, "og:video:tag") ||
     null
   );
 }
 
 function getContentType(html) {
-  return getMeta(html, "og:type") || null;
+  return getMeta(html, "og:type");
 }
 
+/* -------------------------------------------------------
+   JSON-LD EXTRACTION
+------------------------------------------------------- */
+
 function getJsonLd(html) {
-  const scripts = html.matchAll(
-    /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi
-  );
+  const scriptPattern =
+    /<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
 
-  for (const match of scripts) {
+  const scripts = html.matchAll(scriptPattern);
+
+  for (const script of scripts) {
     try {
-      const data = JSON.parse(match[1].trim());
-      const objects = Array.isArray(data) ? data : [data];
+      const parsed = JSON.parse(
+        script[1].trim()
+      );
 
-      for (const item of objects) {
-        if (!item || typeof item !== "object") continue;
+      const roots = Array.isArray(parsed)
+        ? parsed
+        : [parsed];
 
-        // Handle JSON-LD graphs.
-        const candidates = Array.isArray(item["@graph"])
-          ? item["@graph"]
-          : [item];
+      for (const root of roots) {
+        if (!root || typeof root !== "object") {
+          continue;
+        }
 
-        for (const candidate of candidates) {
-          if (!candidate || typeof candidate !== "object") continue;
+        const candidates = Array.isArray(
+          root["@graph"]
+        )
+          ? root["@graph"]
+          : [root];
 
-          const image = Array.isArray(candidate.image)
-            ? candidate.image[0]
-            : candidate.image;
+        for (const item of candidates) {
+          if (
+            !item ||
+            typeof item !== "object"
+          ) {
+            continue;
+          }
 
-          const author = Array.isArray(candidate.author)
-            ? candidate.author[0]
-            : candidate.author;
+          const image = Array.isArray(item.image)
+            ? item.image[0]
+            : item.image;
 
-          const name = author && typeof author === "object"
-            ? author.name
-            : author;
+          const author = Array.isArray(item.author)
+            ? item.author[0]
+            : item.author;
+
+          const authorName =
+            typeof author === "string"
+              ? author
+              : author?.name || null;
+
+          const thumbnail =
+            typeof image === "string"
+              ? image
+              : image?.url ||
+                image?.contentUrl ||
+                null;
 
           const result = {
-            title: candidate.headline || candidate.name || null,
-            description: candidate.description || null,
-            thumbnail: typeof image === "string"
-              ? image
-              : image?.url || image?.contentUrl || null,
-            author: typeof name === "string" ? name : null,
-            type: Array.isArray(candidate["@type"])
-              ? candidate["@type"][0]
-              : candidate["@type"] || null
+            title:
+              item.headline ||
+              item.name ||
+              null,
+
+            description:
+              item.description || null,
+
+            thumbnail,
+
+            author: authorName,
+
+            type: Array.isArray(item["@type"])
+              ? item["@type"][0]
+              : item["@type"] || null,
           };
 
           if (
@@ -191,26 +365,19 @@ function getJsonLd(html) {
         }
       }
     } catch {
-      // Continue when the page contains invalid JSON-LD.
+      // Ignore invalid JSON-LD and inspect the next script.
     }
   }
 
   return {};
 }
 
-function normalizeImage(image, pageUrl) {
-  if (!image) return null;
-
-  try {
-    const parsed = new URL(image, pageUrl);
-    return parsed.protocol === "https:" ? parsed.href : null;
-  } catch {
-    return null;
-  }
-}
+/* -------------------------------------------------------
+   URL VALIDATION
+------------------------------------------------------- */
 
 function cleanUrl(url) {
-  const cleaned = new URL(url.href);
+  const result = new URL(url.href);
 
   const trackingParameters = [
     "si",
@@ -223,28 +390,31 @@ function cleanUrl(url) {
     "utm_content",
     "utm_term",
     "fbclid",
-    "gclid"
+    "gclid",
   ];
 
   for (const parameter of trackingParameters) {
-    cleaned.searchParams.delete(parameter);
+    result.searchParams.delete(parameter);
   }
 
-  cleaned.hash = "";
-  return cleaned.href;
+  result.hash = "";
+
+  return result.href;
 }
 
 function isAllowedHost(platform, hostname) {
-  return PLATFORM_DOMAINS[platform]?.includes(
-    hostname.toLowerCase()
-  ) ?? false;
+  return (
+    PLATFORM_DOMAINS[platform]?.includes(
+      hostname.toLowerCase()
+    ) ?? false
+  );
 }
 
 function validateTarget(platform, rawUrl) {
   if (
     typeof rawUrl !== "string" ||
     !rawUrl.trim() ||
-    rawUrl.length > 4096
+    rawUrl.length > MAX_URL_LENGTH
   ) {
     throw new Error("INVALID_URL");
   }
@@ -266,70 +436,127 @@ function validateTarget(platform, rawUrl) {
     throw new Error("INVALID_URL");
   }
 
-  if (!isAllowedHost(platform, target.hostname)) {
+  if (
+    !isAllowedHost(
+      platform,
+      target.hostname
+    )
+  ) {
     throw new Error("PLATFORM_MISMATCH");
   }
 
   return target;
 }
 
-async function fetchHtml(platform, initialUrl) {
-  let currentUrl = new URL(initialUrl.href);
+/* -------------------------------------------------------
+   SAFE HTML FETCHING
+------------------------------------------------------- */
 
-  for (let attempt = 0; attempt <= MAX_REDIRECTS; attempt++) {
+async function fetchHtml(platform, initialUrl) {
+  let currentUrl = new URL(
+    initialUrl.href
+  );
+
+  for (
+    let attempt = 0;
+    attempt <= MAX_REDIRECTS;
+    attempt++
+  ) {
     if (
       currentUrl.protocol !== "https:" ||
-      !isAllowedHost(platform, currentUrl.hostname)
+      !isAllowedHost(
+        platform,
+        currentUrl.hostname
+      )
     ) {
-      throw new Error("UPSTREAM_REDIRECT_BLOCKED");
+      throw new Error(
+        "UPSTREAM_REDIRECT_BLOCKED"
+      );
     }
 
-    const response = await fetch(currentUrl.href, {
-      method: "GET",
-      redirect: "manual",
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
-          "AppleWebKit/537.36 (KHTML, like Gecko) " +
-          "Chrome/131.0.0.0 Safari/537.36",
-        "Accept":
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9"
-      },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT)
-    });
+    const response = await fetch(
+      currentUrl.href,
+      {
+        method: "GET",
+        redirect: "manual",
 
-    if ([301, 302, 303, 307, 308].includes(response.status)) {
-      const location = response.headers.get("location");
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+            "AppleWebKit/537.36 (KHTML, like Gecko) " +
+            "Chrome/131.0.0.0 Safari/537.36",
 
-      if (!location || attempt === MAX_REDIRECTS) {
-        throw new Error("UPSTREAM_REDIRECT_LIMIT");
+          Accept:
+            "text/html,application/xhtml+xml," +
+            "application/xml;q=0.9,*/*;q=0.8",
+
+          "Accept-Language":
+            "en-US,en;q=0.9",
+        },
+
+        signal: AbortSignal.timeout(
+          FETCH_TIMEOUT
+        ),
+      }
+    );
+
+    if (
+      [301, 302, 303, 307, 308].includes(
+        response.status
+      )
+    ) {
+      const location =
+        response.headers.get("location");
+
+      if (
+        !location ||
+        attempt === MAX_REDIRECTS
+      ) {
+        throw new Error(
+          "UPSTREAM_REDIRECT_LIMIT"
+        );
       }
 
-      const nextUrl = new URL(location, currentUrl);
+      const nextUrl = new URL(
+        location,
+        currentUrl
+      );
 
       if (
         nextUrl.protocol !== "https:" ||
-        !isAllowedHost(platform, nextUrl.hostname)
+        !isAllowedHost(
+          platform,
+          nextUrl.hostname
+        )
       ) {
-        throw new Error("UPSTREAM_REDIRECT_BLOCKED");
+        throw new Error(
+          "UPSTREAM_REDIRECT_BLOCKED"
+        );
       }
 
       currentUrl = nextUrl;
+
       continue;
     }
 
     if (!response.ok) {
-      throw new Error(`UPSTREAM_HTTP_${response.status}`);
+      throw new Error(
+        `UPSTREAM_HTTP_${response.status}`
+      );
     }
 
-    const contentType = response.headers.get("content-type") || "";
+    const contentType =
+      response.headers.get("content-type") || "";
 
     if (
       !contentType.includes("text/html") &&
-      !contentType.includes("application/xhtml+xml")
+      !contentType.includes(
+        "application/xhtml+xml"
+      )
     ) {
-      throw new Error("UPSTREAM_NOT_HTML");
+      throw new Error(
+        "UPSTREAM_NOT_HTML"
+      );
     }
 
     const declaredLength = Number(
@@ -337,53 +564,68 @@ async function fetchHtml(platform, initialUrl) {
     );
 
     if (declaredLength > MAX_HTML_SIZE) {
-      throw new Error("UPSTREAM_RESPONSE_TOO_LARGE");
+      throw new Error(
+        "UPSTREAM_RESPONSE_TOO_LARGE"
+      );
     }
 
     const html = await response.text();
 
     if (html.length > MAX_HTML_SIZE) {
-      throw new Error("UPSTREAM_RESPONSE_TOO_LARGE");
+      throw new Error(
+        "UPSTREAM_RESPONSE_TOO_LARGE"
+      );
     }
 
-    return { html, finalUrl: currentUrl };
+    return {
+      html,
+      finalUrl: currentUrl,
+    };
   }
 
-  throw new Error("UPSTREAM_REDIRECT_LIMIT");
+  throw new Error(
+    "UPSTREAM_REDIRECT_LIMIT"
+  );
 }
 
-const GENERIC_TITLES = new Set([
-  "instagram",
-  "facebook",
-  "log in • instagram",
-  "log in • instagram",
-  "facebook - log in or sign up",
-  "log in or sign up to view"
-]);
-
-function isGenericTitle(value) {
-  return typeof value === "string" &&
-    GENERIC_TITLES.has(value.trim().toLowerCase());
-}
+/* -------------------------------------------------------
+   INSTAGRAM / FACEBOOK
+------------------------------------------------------- */
 
 async function fetchOpenGraph(platform, url) {
-  const { html, finalUrl } = await fetchHtml(platform, url);
+  const { html, finalUrl } =
+    await fetchHtml(platform, url);
+
   const jsonLd = getJsonLd(html);
 
   const htmlTitle = getTitle(html);
 
-  // Do not mistake a generic login page title for the post title.
-  const title = isGenericTitle(htmlTitle)
-    ? (!isGenericTitle(jsonLd.title) ? jsonLd.title || null : null)
-    : (htmlTitle || jsonLd.title || null);
+  // Never accept a generic platform title.
+  const title = !isGenericTitle(htmlTitle)
+    ? htmlTitle
+    : (
+        !isGenericTitle(jsonLd.title)
+          ? jsonLd.title
+          : null
+      );
 
-  const description =
+  const rawDescription =
     getDescription(html) ||
     jsonLd.description ||
     null;
 
+  const description =
+    cleanGenericDescription(
+      rawDescription
+    );
+
+  const rawThumbnail =
+    getThumbnail(html) ||
+    jsonLd.thumbnail ||
+    null;
+
   const thumbnail = normalizeImage(
-    getThumbnail(html) || jsonLd.thumbnail || null,
+    rawThumbnail,
     finalUrl.href
   );
 
@@ -398,10 +640,13 @@ async function fetchOpenGraph(platform, url) {
     null;
 
   if (
-    (platform === "ig" && /\/(reel|reels|p)\//i.test(url.pathname)) ||
-    (platform === "yt" && url.pathname.includes("/shorts/")) ||
-    platform === "tt"
+    platform === "ig" &&
+    /\/(reel|reels|p)\//i.test(url.pathname)
   ) {
+    type = "video";
+  }
+
+  if (platform === "tt") {
     type = "video";
   }
 
@@ -410,22 +655,46 @@ async function fetchOpenGraph(platform, url) {
     description,
     thumbnail,
     author,
-    type: type || "video"
+    type: type || "video",
   };
 }
+
+/* -------------------------------------------------------
+   YOUTUBE
+------------------------------------------------------- */
 
 async function fetchYouTube(url) {
-  const endpoint = new URL("https://www.youtube.com/oembed");
-  endpoint.searchParams.set("url", url.href);
-  endpoint.searchParams.set("format", "json");
+  const endpoint = new URL(
+    "https://www.youtube.com/oembed"
+  );
 
-  const response = await fetch(endpoint.href, {
-    headers: { Accept: "application/json" },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT)
-  });
+  endpoint.searchParams.set(
+    "url",
+    url.href
+  );
+
+  endpoint.searchParams.set(
+    "format",
+    "json"
+  );
+
+  const response = await fetch(
+    endpoint.href,
+    {
+      headers: {
+        Accept: "application/json",
+      },
+
+      signal: AbortSignal.timeout(
+        FETCH_TIMEOUT
+      ),
+    }
+  );
 
   if (!response.ok) {
-    throw new Error(`YOUTUBE_OEMBED_HTTP_${response.status}`);
+    throw new Error(
+      `YOUTUBE_OEMBED_HTTP_${response.status}`
+    );
   }
 
   const data = await response.json();
@@ -433,233 +702,48 @@ async function fetchYouTube(url) {
   return {
     title: data.title || null,
     description: null,
-    thumbnail: normalizeImage(data.thumbnail_url, url.href),
-    author: data.author_name || null,
-    type: "video"
-  };
-}
 
-async function fetchTikTok(url) {
-  const endpoint = new URL("https://www.tiktok.com/oembed");
-  endpoint.searchParams.set("url", url.href);
-
-  const response = await fetch(endpoint.href, {
-    headers: { Accept: "application/json" },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT)
-  });
-
-  if (!response.ok) {
-    throw new Error(`TIKTOK_OEMBED_HTTP_${response.status}`);
-  }
-
-  const data = await response.json();
-
-  return {
-    title: data.title || null,
-    description: data.title || null,
-    thumbnail: normalizeImage(data.thumbnail_url, url.href),
-    author: data.author_name || null,
-    type: data.type || "video"
-  };
-}
-
-async function getMetadata(platform, url) {
-  if (platform === "yt") return fetchYouTube(url);
-  if (platform === "tt") return fetchTikTok(url);
-  if (platform === "ig" || platform === "fb") {
-    return fetchOpenGraph(platform, url);
-  }
-
-  throw new Error("UNSUPPORTED_PLATFORM");
-}
-
-export default {
-  async fetch(request) {
-    const requestUrl = new URL(request.url);
-
-    if (request.method !== "GET") {
-      return errorResponse(
-        "METHOD_NOT_ALLOWED",
-        "Only GET requests are supported.",
-        405
-      );
-    }
-
-    if (requestUrl.pathname === "/") {
-      return json({
-        success: true,
-        name: "KeepItBack Metadata API",
-        version: "1.2.0",
-        platforms: Object.keys(PLATFORM_NAMES),
-        usage: {
-          query: "/yt?url=<encoded-url>",
-          path: "/yt/<url>"
-        }
-      });
-    }
-
-    const parts = requestUrl.pathname.split("/").filter(Boolean);
-    const platform = parts[0];
-
-    if (!PLATFORM_NAMES[platform]) {
-      return errorResponse(
-        "UNSUPPORTED_PLATFORM",
-        "Supported platform codes: yt, ig, tt, fb.",
-        404
-      );
-    }
-
-    let rawUrl = requestUrl.searchParams.get("url");
-
-    if (!rawUrl && parts.length > 1) {
-      rawUrl = parts.slice(1).join("/");
-
-      try {
-        rawUrl = decodeURIComponent(rawUrl);
-      } catch {
-        return errorResponse(
-          "INVALID_URL",
-          "The supplied URL is incorrectly encoded."
-        );
-      }
-    }
-
-    if (!rawUrl) {
-      return errorResponse(
-        "MISSING_URL",
-        "Provide a URL using ?url=<encoded-url>."
-      );
-    }
-
-    let target;
-
-    try {
-      target = validateTarget(platform, rawUrl);
-    } catch (error) {
-      if (error.message === "PLATFORM_MISMATCH") {
-        return errorResponse(
-          "PLATFORM_MISMATCH",
-          "The URL does not belong to the selected platform."
-        );
-      }
-
-      return errorResponse(
-        "INVALID_URL",
-        "Provide a valid HTTPS URL from a supported domain."
-      );
-    }
-
-    try {
-      const metadata = await getMetadata(platform, target);
-
-      const hasUsefulTitle =
-        metadata.title && !isGenericTitle(metadata.title);
-
-      if (
-        !hasUsefulTitle &&
-        !metadata.thumbnail &&
-        !metadata.description
-      ) {
-        return errorResponse(
-          "METADATA_UNAVAILABLE",
-          "No usable metadata was found. The platform may have returned a login page, restricted the request, or omitted metadata.",
-          502
-        );
-      }
-
-      return json({
-        success: true,
-        platform: PLATFORM_NAMES[platform],
-        url: cleanUrl(target),
-        title: hasUsefulTitle ? metadata.title : null,
-        description: metadata.description || null,
-        thumbnail: metadata.thumbnail || null,
-        author: metadata.author || null,
-        type: metadata.type || "video"
-      });
-    } catch (error) {
-      console.error("Metadata extraction failed", {
-        platform,
-        error: error instanceof Error ? error.message : String(error)
-      });
-
-      let message =
-        "The platform did not provide usable metadata. The content may be private, unavailable, or restricted.";
-
-      if (
-        error instanceof Error &&
-        error.message.startsWith("UPSTREAM_HTTP_")
-      ) {
-        message =
-          "The upstream platform returned an HTTP error. Check Cloudflare Worker logs for details.";
-      } else if (
-        error instanceof Error &&
-        error.message.startsWith("UPSTREAM_REDIRECT")
-      ) {
-        message =
-          "The upstream platform redirected the request somewhere that could not be followed safely.";
-      } else if (
-        error instanceof Error &&
-        error.message === "UPSTREAM_NOT_HTML"
-      ) {
-        message = "The upstream platform did not return an HTML page.";
-      } else if (
-        error instanceof Error &&
-        error.name === "TimeoutError"
-      ) {
-        message = "The upstream platform took too long to respond.";
-      }
-
-      return errorResponse("METADATA_UNAVAILABLE", message, 502);
-    }
-  }
-};
-  endpoint.searchParams.set("format", "json");
-
-  const response = await fetch(endpoint.href, {
-    headers: {
-      Accept: "application/json"
-    },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT)
-  });
-
-  if (!response.ok) {
-    throw new Error(`YOUTUBE_OEMBED_HTTP_${response.status}`);
-  }
-
-  const data = await response.json();
-
-  return {
-    title: data.title || null,
-    description: null,
     thumbnail: normalizeImage(
       data.thumbnail_url,
       url.href
     ),
+
     author: data.author_name || null,
-    type: "video"
+    type: "video",
   };
 }
 
-/*
- * TikTok oEmbed.
- */
+/* -------------------------------------------------------
+   TIKTOK
+------------------------------------------------------- */
+
 async function fetchTikTok(url) {
   const endpoint = new URL(
     "https://www.tiktok.com/oembed"
   );
 
-  endpoint.searchParams.set("url", url.href);
+  endpoint.searchParams.set(
+    "url",
+    url.href
+  );
 
-  const response = await fetch(endpoint.href, {
-    headers: {
-      Accept: "application/json"
-    },
-    signal: AbortSignal.timeout(FETCH_TIMEOUT)
-  });
+  const response = await fetch(
+    endpoint.href,
+    {
+      headers: {
+        Accept: "application/json",
+      },
+
+      signal: AbortSignal.timeout(
+        FETCH_TIMEOUT
+      ),
+    }
+  );
 
   if (!response.ok) {
-    throw new Error(`TIKTOK_OEMBED_HTTP_${response.status}`);
+    throw new Error(
+      `TIKTOK_OEMBED_HTTP_${response.status}`
+    );
   }
 
   const data = await response.json();
@@ -667,18 +751,51 @@ async function fetchTikTok(url) {
   return {
     title: data.title || null,
     description: data.title || null,
+
     thumbnail: normalizeImage(
       data.thumbnail_url,
       url.href
     ),
+
     author: data.author_name || null,
-    type: data.type || "video"
+    type: data.type || "video",
   };
 }
 
-/*
- * Route metadata extraction to the correct platform.
- */
+/* -------------------------------------------------------
+   IMAGE URL NORMALIZATION
+------------------------------------------------------- */
+
+function normalizeImage(image, pageUrl) {
+  if (
+    !image ||
+    typeof image !== "string"
+  ) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(
+      image,
+      pageUrl
+    );
+
+    if (
+      parsed.protocol !== "https:"
+    ) {
+      return null;
+    }
+
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
+/* -------------------------------------------------------
+   PLATFORM ROUTER
+------------------------------------------------------- */
+
 async function getMetadata(platform, url) {
   if (platform === "yt") {
     return fetchYouTube(url);
@@ -688,16 +805,30 @@ async function getMetadata(platform, url) {
     return fetchTikTok(url);
   }
 
-  if (platform === "ig" || platform === "fb") {
-    return fetchOpenGraph(platform, url);
+  if (
+    platform === "ig" ||
+    platform === "fb"
+  ) {
+    return fetchOpenGraph(
+      platform,
+      url
+    );
   }
 
-  throw new Error("UNSUPPORTED_PLATFORM");
+  throw new Error(
+    "UNSUPPORTED_PLATFORM"
+  );
 }
+
+/* -------------------------------------------------------
+   MAIN CLOUDFLARE WORKER
+------------------------------------------------------- */
 
 export default {
   async fetch(request) {
-    const requestUrl = new URL(request.url);
+    const requestUrl = new URL(
+      request.url
+    );
 
     if (request.method !== "GET") {
       return errorResponse(
@@ -707,19 +838,23 @@ export default {
       );
     }
 
-    /*
-     * API health endpoint.
-     */
+    // API information endpoint.
     if (requestUrl.pathname === "/") {
       return json({
         success: true,
         name: "KeepItBack Metadata API",
-        version: "1.1.0",
-        platforms: Object.keys(PLATFORM_NAMES),
+        version: VERSION,
+
+        platforms: Object.keys(
+          PLATFORM_NAMES
+        ),
+
         usage: {
           query: "/yt?url=<encoded-url>",
-          path: "/yt/<url>"
-        }
+          instagram: "/ig?url=<encoded-url>",
+          tiktok: "/tt?url=<encoded-url>",
+          facebook: "/fb?url=<encoded-url>",
+        },
       });
     }
 
@@ -737,24 +872,19 @@ export default {
       );
     }
 
-    /*
-     * Preferred format:
-     * /ig?url=https%3A%2F%2Fwww.instagram.com%2Freel%2F...
-     */
-    let rawUrl = requestUrl.searchParams.get("url");
+    let rawUrl =
+      requestUrl.searchParams.get("url");
 
-    /*
-     * Also support the path format:
-     * /ig/https://www.instagram.com/reel/SHORTCODE/
-     *
-     * Query format is recommended because URLs contain
-     * their own slashes and query parameters.
-     */
+    // Optional path-based URL format.
     if (!rawUrl && parts.length > 1) {
-      rawUrl = parts.slice(1).join("/");
+      rawUrl = parts
+        .slice(1)
+        .join("/");
 
       try {
-        rawUrl = decodeURIComponent(rawUrl);
+        rawUrl = decodeURIComponent(
+          rawUrl
+        );
       } catch {
         return errorResponse(
           "INVALID_URL",
@@ -773,9 +903,15 @@ export default {
     let target;
 
     try {
-      target = validateTarget(platform, rawUrl);
+      target = validateTarget(
+        platform,
+        rawUrl
+      );
     } catch (error) {
-      if (error.message === "PLATFORM_MISMATCH") {
+      if (
+        error.message ===
+        "PLATFORM_MISMATCH"
+      ) {
         return errorResponse(
           "PLATFORM_MISMATCH",
           "The URL does not belong to the selected platform."
@@ -789,72 +925,133 @@ export default {
     }
 
     try {
-      const metadata = await getMetadata(platform, target);
+      const metadata = await getMetadata(
+        platform,
+        target
+      );
 
-      /*
-       * Don't treat an empty login page as a successful result.
-       */
+      // Filter generic titles before returning success.
+      const hasUsefulTitle =
+        typeof metadata.title === "string" &&
+        !isGenericTitle(metadata.title);
+
+      const description =
+        cleanGenericDescription(
+          metadata.description
+        );
+
+      const thumbnail =
+        metadata.thumbnail || null;
+
+      // No actual metadata? Do not return success.
       if (
-        !metadata.title &&
-        !metadata.thumbnail &&
-        !metadata.description
+        !hasUsefulTitle &&
+        !description &&
+        !thumbnail
       ) {
         return errorResponse(
           "METADATA_UNAVAILABLE",
+
           "No usable metadata was found. The platform may have returned a login page, restricted the request, or omitted metadata.",
+
           502
         );
       }
 
       return json({
         success: true,
-        platform: PLATFORM_NAMES[platform],
+
+        platform:
+          PLATFORM_NAMES[platform],
+
         url: cleanUrl(target),
-        title: metadata.title || null,
-        description: metadata.description || null,
-        thumbnail: metadata.thumbnail || null,
-        author: metadata.author || null,
-        type: metadata.type || "video"
+
+        title: hasUsefulTitle
+          ? metadata.title
+          : null,
+
+        description:
+          description || null,
+
+        thumbnail,
+
+        author:
+          metadata.author || null,
+
+        type:
+          metadata.type || "video",
       });
     } catch (error) {
-      /*
-       * Keep detailed diagnostics in Cloudflare logs.
-       * Do not expose upstream response bodies to clients.
-       */
-      console.error("Metadata extraction failed", {
-        platform,
-        error: error instanceof Error
-          ? error.message
-          : String(error)
-      });
+      console.error(
+        "Metadata extraction failed",
+        {
+          platform,
+
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+        }
+      );
 
       let message =
         "The platform did not provide usable metadata. The content may be private, unavailable, or restricted.";
 
       if (
         error instanceof Error &&
-        error.message.startsWith("UPSTREAM_HTTP_")
+        error.message.startsWith(
+          "UPSTREAM_HTTP_"
+        )
       ) {
         message =
           "The upstream platform returned an HTTP error. Check Cloudflare Worker logs for details.";
       } else if (
         error instanceof Error &&
-        error.message.startsWith("UPSTREAM_REDIRECT")
+        error.message.startsWith(
+          "UPSTREAM_REDIRECT"
+        )
       ) {
         message =
           "The upstream platform redirected the request somewhere that could not be followed safely.";
       } else if (
         error instanceof Error &&
-        error.message === "UPSTREAM_NOT_HTML"
+        error.message ===
+          "UPSTREAM_NOT_HTML"
       ) {
         message =
           "The upstream platform did not return an HTML page.";
       } else if (
         error instanceof Error &&
-        error.name === "TimeoutError"
+        error.message ===
+          "UPSTREAM_RESPONSE_TOO_LARGE"
+      ) {
+        message =
+          "The upstream HTML response exceeded the allowed size.";
+      } else if (
+        error instanceof Error &&
+        (
+          error.name === "TimeoutError" ||
+          error.name === "AbortError"
+        )
       ) {
         message =
           "The upstream platform took too long to respond.";
+      } else if (
+        error instanceof Error &&
+        error.message.startsWith(
+          "YOUTUBE_OEMBED_HTTP_"
+        )
+      ) {
+        message =
+          "YouTube could not provide metadata for this URL.";
+      } else if (
+        error instanceof Error &&
+        error.message.startsWith(
+          "TIKTOK_OEMBED_HTTP_"
+        )
+      ) {
+        message =
+          "TikTok could not provide metadata for this URL.";
       }
 
       return errorResponse(
@@ -863,5 +1060,5 @@ export default {
         502
       );
     }
-  }
+  },
 };
